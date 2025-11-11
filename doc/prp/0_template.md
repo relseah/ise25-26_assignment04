@@ -259,7 +259,6 @@ When specifying <code>[[Overpass API/Overpass QL#out|out geom]]</code>, the full
 </osm>
 
 </source>
-```
 
 ==Technical features of change formats==
 This a list of things that are desirable in a change file format for exampe [[change sets]]
