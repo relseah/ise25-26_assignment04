@@ -17,6 +17,7 @@ import org.jspecify.annotations.NonNull;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -65,14 +66,13 @@ public class PosServiceImpl implements PosService {
     }
 
     @Override
-    public @NonNull Pos importFromOsmNode(@NonNull Long nodeId) throws OsmNodeNotFoundException {
+    public @NonNull Pos importFromOsmNode(@NonNull Long nodeId) throws OsmNodeNotFoundException, OsmNodeMissingFieldsException, DuplicatePosNameException {
         log.info("Importing POS from OpenStreetMap node {}...", nodeId);
 
         // Fetch the OSM node data using the port
         OsmNode osmNode = osmDataService.fetchNode(nodeId);
 
         // Convert OSM node to POS domain object and upsert it
-        // TODO: Implement the actual conversion (the response is currently hard-coded).
         Pos savedPos = upsert(convertOsmNodeToPos(osmNode));
         log.info("Successfully imported POS '{}' from OSM node {}", savedPos.name(), nodeId);
 
@@ -81,23 +81,137 @@ public class PosServiceImpl implements PosService {
 
     /**
      * Converts an OSM node to a POS domain object.
-     * Note: This is a stub implementation and should be replaced with real mapping logic.
+     * Extracts relevant information from OSM tags and validates that all required fields are present.
+     *
+     * @param osmNode the OSM node to convert
+     * @return the converted POS object
+     * @throws OsmNodeMissingFieldsException if required fields are missing
      */
-    private @NonNull Pos convertOsmNodeToPos(@NonNull OsmNode osmNode) {
-        if (osmNode.nodeId().equals(5589879349L)) {
-            return Pos.builder()
-                    .name("Rada Coffee & Rösterei")
-                    .description("Caffé und Rösterei")
-                    .type(PosType.CAFE)
-                    .campus(CampusType.ALTSTADT)
-                    .street("Untere Straße")
-                    .houseNumber("21")
-                    .postalCode(69117)
-                    .city("Heidelberg")
-                    .build();
-        } else {
+    private @NonNull Pos convertOsmNodeToPos(@NonNull OsmNode osmNode) throws OsmNodeMissingFieldsException {
+        var tags = osmNode.tags();
+
+        // Extract name (required)
+        String name = tags.get("name");
+        if (name == null || name.isBlank()) {
             throw new OsmNodeMissingFieldsException(osmNode.nodeId());
         }
+
+        // Extract description (optional, use description, note, or empty string)
+        String description = tags.getOrDefault("description", 
+                tags.getOrDefault("note", ""));
+
+        // Extract address fields (required)
+        String street = tags.get("addr:street");
+        String houseNumber = tags.get("addr:housenumber");
+        String postalCodeStr = tags.get("addr:postcode");
+        String city = tags.get("addr:city");
+
+        // Validate required address fields
+        if (street == null || street.isBlank() ||
+            houseNumber == null || houseNumber.isBlank() ||
+            postalCodeStr == null || postalCodeStr.isBlank() ||
+            city == null || city.isBlank()) {
+            throw new OsmNodeMissingFieldsException(osmNode.nodeId());
+        }
+
+        // Parse postal code
+        Integer postalCode;
+        try {
+            postalCode = Integer.parseInt(postalCodeStr.trim());
+        } catch (NumberFormatException e) {
+            log.warn("Invalid postal code '{}' for OSM node {}", postalCodeStr, osmNode.nodeId());
+            throw new OsmNodeMissingFieldsException(osmNode.nodeId());
+        }
+
+        // Map OSM amenity/shop type to PosType
+        PosType posType = mapOsmTypeToPosType(tags);
+        if (posType == null) {
+            throw new OsmNodeMissingFieldsException(osmNode.nodeId());
+        }
+
+        // Determine campus based on location or address
+        CampusType campus = determineCampus(osmNode, city);
+
+        return Pos.builder()
+                .name(name.trim())
+                .description(description.trim())
+                .type(posType)
+                .campus(campus)
+                .street(street.trim())
+                .houseNumber(houseNumber.trim())
+                .postalCode(postalCode)
+                .city(city.trim())
+                .build();
+    }
+
+    /**
+     * Maps OSM amenity/shop types to PosType enum.
+     *
+     * @param tags the OSM tags
+     * @return the corresponding PosType, or null if no match
+     */
+    private PosType mapOsmTypeToPosType(@NonNull Map<String, String> tags) {
+        String amenity = tags.get("amenity");
+        String shop = tags.get("shop");
+
+        // Check amenity first
+        if (amenity != null) {
+            return switch (amenity.toLowerCase()) {
+                case "cafe", "coffee_shop" -> PosType.CAFE;
+                case "cafeteria", "restaurant" -> PosType.CAFETERIA;
+                case "vending_machine" -> PosType.VENDING_MACHINE;
+                default -> null;
+            };
+        }
+
+        // Check shop type
+        if (shop != null) {
+            return switch (shop.toLowerCase()) {
+                case "coffee", "cafe" -> PosType.CAFE;
+                case "bakery" -> PosType.BAKERY;
+                default -> null;
+            };
+        }
+
+        return null;
+    }
+
+    /**
+     * Determines the campus type based on location or address.
+     * Uses heuristics based on city name and coordinates for Heidelberg.
+     *
+     * @param osmNode the OSM node with location data
+     * @param city the city name from address
+     * @return the determined CampusType, defaults to ALTSTADT if uncertain
+     */
+    private CampusType determineCampus(@NonNull OsmNode osmNode, String city) {
+        // If not in Heidelberg, default to ALTSTADT
+        if (city == null || !city.toLowerCase().contains("heidelberg")) {
+            return CampusType.ALTSTADT;
+        }
+
+        // Use coordinates if available to determine campus
+        if (osmNode.latitude() != null && osmNode.longitude() != null) {
+            double lat = osmNode.latitude();
+            double lon = osmNode.longitude();
+
+            // Approximate campus boundaries in Heidelberg
+            // ALTSTADT: around lat 49.41, lon 8.70
+            // BERGHEIM: around lat 49.40, lon 8.69
+            // INF (Im Neuenheimer Feld): around lat 49.42, lon 8.68
+
+            // Simple heuristic based on latitude and longitude
+            if (lat > 49.415 && lon < 8.685) {
+                return CampusType.INF;
+            } else if (lat < 49.405) {
+                return CampusType.BERGHEIM;
+            } else {
+                return CampusType.ALTSTADT;
+            }
+        }
+
+        // Default to ALTSTADT if coordinates are not available
+        return CampusType.ALTSTADT;
     }
 
     /**
